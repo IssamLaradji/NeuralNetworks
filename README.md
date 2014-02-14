@@ -1,7 +1,22 @@
-Multi-layer-perceptron
+Neural Network Toolbox
 ======================
 
-To use the code, simply download multilayer_perceptron.py. mlp_example.py shows an example of using the algorithm on the popular XOR problem.  It is based on scikit's convention - http://scikit-learn.org/stable/. In fact, I pushed it as a pull-request to scikit's GitHub, and now it waits for the final review.
 
-Please email me if you face issues or feel that some parts of the code are incorrect :).
+This is a repository containing several state-of-the-art methods in the field of Neural Networks. Inspired by 
+scikit-learn style - http://scikit-learn.org/stable/modules/, the code files are meant to be easy-to-use and 
+flexible to different datasets. Each folder hosts one algorithm with an example file demonstraing its usage. 
 
+Current available algorithms are,
+
+  +  Multi-layer Perceptron
+
+  +  Sparse Auto-enoders
+
+  + Extreme Learning Machines
+
+  + Deep Belief Network
+
+  + Convolutional Neural Network (in draft mode)
+
+
+More algorithms will be uploaded soon!
