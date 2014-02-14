@@ -19,4 +19,4 @@ Current available algorithms,
   + Convolutional Neural Network (in draft mode)
 
 
-More algorithms will be uploaded soon!
+More will be uploaded soon!
