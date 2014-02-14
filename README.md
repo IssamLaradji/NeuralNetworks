@@ -6,7 +6,7 @@ This is a repository containing several state-of-the-art methods in the field of
 scikit-learn style - http://scikit-learn.org/stable/modules/, the code files are meant to be easy-to-use and 
 flexible to different datasets. Each folder hosts one algorithm with an example file demonstraing its usage. 
 
-Current available algorithms are,
+Current available algorithms,
 
   +  Multi-layer Perceptron
 
