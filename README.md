@@ -8,13 +8,11 @@ flexible to different datasets. Each folder hosts one algorithm with an example 
 
 Current available algorithms,
 
-  +  Multi-layer Perceptron
+  + Multi-layer Perceptron (contains classifier, regressor and sparse auto-encoder)
 
-  +  Sparse Auto-enoders
+To be uploaded soon,
 
   + Extreme Learning Machines
-
-  + Deep Belief Network
 
   + Convolutional Neural Network (in draft mode)
 
