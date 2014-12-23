@@ -1,103 +1,30 @@
-"""Multi-layer perceptron
+"""Multi-layer Perceptron
 """
 
 # Author: Issam H. Laradji <issam.laradji@gmail.com>
-# Credits to: Amueller and Larsmans codes on MLP
-# Licence: BSD 3 clause
+# License: BSD 3 clause
 
 import numpy as np
 
 from abc import ABCMeta, abstractmethod
 from scipy.optimize import fmin_l_bfgs_b
+import warnings
 
+from base import logistic, softmax, binary_KL_divergence
+from base import ACTIVATIONS, DERIVATIVES, LOSS_FUNCTIONS
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from sklearn.base import TransformerMixin
 from sklearn.externals import six
 from sklearn.preprocessing import LabelBinarizer
-from sklearn.utils import gen_even_slices
+from sklearn.utils import gen_batches, check_random_state
 from sklearn.utils import shuffle
-from sklearn.utils import atleast2d_or_csr, check_random_state, column_or_1d
-from sklearn.utils.extmath import logistic_sigmoid, safe_sparse_dot
+from sklearn.utils import ConvergenceWarning
+from sklearn.utils.extmath import safe_sparse_dot
 
 
-def _identity(X):
-    """returns the same input array."""
-    return X
-
-
-def _d_logistic(sigm_X):
-    """Implements the derivative of the logistic function.
-
-    Parameters
-    ----------
-    X : {array-like, sparse matrix}, shape (n_samples, n_features)
-
-    Returns
-    -------
-    X_new : {array-like, sparse matrix}, shape (n_samples, n_features)
-    """
-    return sigm_X * (1 - sigm_X)
-
-
-def _softmax(Z):
-    """Implements the K-way softmax, (exp(Z).T / exp(Z).sum(axis=1)).T
-
-    Parameters
-    ----------
-    X : {array-like, sparse matrix}, shape (n_samples, n_features)
-
-    Returns
-    -------
-    X_new : {array-like, sparse matrix}, shape (n_samples, n_features)
-    """
-    exp_Z = np.exp(Z)
-    return (exp_Z.T / exp_Z.sum(axis=1)).T
-
-
-def _tanh(X):
-    """Implements the hyperbolic tan function
-
-    Parameters
-    ----------
-    X : {array-like, sparse matrix}, shape (n_samples, n_features)
-
-    Returns
-    -------
-    X_new : {array-like, sparse matrix}, shape (n_samples, n_features)
-    """
-    return np.tanh(X, X)
-
-
-def _d_tanh(Z):
-    """Implements the derivative of the hyperbolic tan function
-
-    Parameters
-    ----------
-    X : {array-like, sparse matrix}, shape (n_samples, n_features)
-
-    Returns
-    -------
-    X_new : {array-like, sparse matrix}, shape (n_samples, n_features)
-    """
-    Z *= Z
-    Z *= -1
-    Z += 1
-    return Z
-
-
-def _squared_loss(Y, Z):
-    """Implements the square loss for regression."""
-    return np.sum((Y - Z) ** 2) / (2 * len(Y))
-
-
-def _log_loss(Y, Z):
-    """Implements Logistic loss for binary class.
-
-    Max/Min clipping is enabled to prevent
-    invalid zero value in log computation.
-    """
-    Z = np.clip(Z, 0.00000001, 0.99999999)
-    return -np.sum(Y * np.log(Z) +
-                  (1 - Y) * np.log(1 - Z)) / Z.shape[0]
+def _pack(layers_coef_, layers_intercept_):
+    """Pack the parameters into a single vector."""
+    return np.hstack([l.ravel() for l in layers_coef_ + layers_intercept_])
 
 
 class BaseMultilayerPerceptron(six.with_metaclass(ABCMeta, BaseEstimator)):
@@ -106,127 +33,454 @@ class BaseMultilayerPerceptron(six.with_metaclass(ABCMeta, BaseEstimator)):
     Warning: This class should not be used directly.
     Use derived classes instead.
     """
-    activation_functions = {
-        'tanh': _tanh,
-        'logistic': logistic_sigmoid,
-        'softmax': _softmax
-    }
-    derivative_functions = {
-        'tanh': _d_tanh,
-        'logistic': _d_logistic
-    }
-    loss_functions = {
-        'squared_loss': _squared_loss,
-        'log_loss': _log_loss,
-    }
 
     @abstractmethod
-    def __init__(
-        self, n_hidden, activation, algorithm,
-            alpha, batch_size, learning_rate, eta0, power_t,
-            max_iter, shuffle, random_state, tol, verbose, warm_start):
+    def __init__(self, hidden_layer_sizes, activation, algorithm,
+                 alpha, batch_size, learning_rate, learning_rate_init, power_t,
+                 max_iter, loss, shuffle, beta, sparsity_param, random_state, tol, verbose,
+                 warm_start):
         self.activation = activation
         self.algorithm = algorithm
         self.alpha = alpha
+        self.beta = beta
+        self.sparsity_param = sparsity_param
         self.batch_size = batch_size
         self.learning_rate = learning_rate
-        self.eta0 = eta0
+        self.learning_rate_init = learning_rate_init
         self.power_t = power_t
         self.max_iter = max_iter
-        self.n_hidden = n_hidden
+        self.loss = loss
+        self.hidden_layer_sizes = hidden_layer_sizes
         self.shuffle = shuffle
         self.random_state = random_state
         self.tol = tol
         self.verbose = verbose
         self.warm_start = warm_start
 
-        self.coef_hidden_ = None
+        self.layers_coef_ = None
+        self.layers_intercept_ = None
+        self.cost_ = None
+        self.n_iter_ = None
+        self.learning_rate_ = None
+        self.classes_ = None
+
+        # iteration count for learning rate schedule
+        # must not be int (e.g. if ``learning_rate=='optimal'``)
         self.t_ = None
-        self.eta_ = None
 
-    def _pack(self, W1, W2, b1, b2):
-        """Pack the coefficients and intercepts from theta."""
-        return np.hstack((W1.ravel(), W2.ravel(),
-                          b1.ravel(), b2.ravel()))
+    def _unpack(self, packed_parameters):
+        """Extract the coefficients and intercepts from packed_parameters."""
+        for i in range(self.n_layers_ - 1):
+            start, end, shape = self._coef_indptr[i]
+            self.layers_coef_[i] = np.reshape(packed_parameters[start:end],
+                                              shape)
 
-    def _unpack(self, theta):
-        """Extracts the coefficients and intercepts from theta.
+            start, end = self._intercept_indptr[i]
+            self.layers_intercept_[i] = packed_parameters[start:end]
+
+    def _forward_pass(self, activations, with_output_activation=True):
+        """Perform a forward pass on the network by computing the values
+        of the neurons in the hidden layers and the output layer.
 
         Parameters
         ----------
-        theta : array-like, shape (size(W1) * size(W2) * size(b1) * size(b2))
-        A vector comprising the  flattened weights : "W1, W2, b1, b2"
+        activations: list, length = n_layers - 1
+            The ith index of the list holds the values of the ith layer.
+
+        with_output_activation : bool, default True
+            If True, the output passes through the output activation
+            function, which is either the softmax function or the
+            logistic function
         """
-        N = self.n_hidden * self.n_features
-        N2 = self.n_outputs * self.n_hidden
+        # Iterate over the hidden layers
+        for i in range(self.n_layers_ - 1):
+            activations[i + 1] = safe_sparse_dot(activations[i],
+                                                 self.layers_coef_[i])
+            activations[i + 1] += self.layers_intercept_[i]
 
-        self.coef_hidden_ = np.reshape(
-            theta[:N], (self.n_features, self.n_hidden))
-        self.coef_output_ = np.reshape(
-            theta[N:N2 + N], (self.n_hidden, self.n_outputs))
-        self.intercept_hidden_ = theta[N2 + N:N2 + N + self.n_hidden]
-        self.intercept_output_ = theta[N2 + N + self.n_hidden:]
+            # For the hidden layers
+            if i + 1 != self.n_layers_ - 1:
+                hidden_activation = ACTIVATIONS[self.activation]
+                activations[i + 1] = hidden_activation(activations[i + 1])
 
-    def _validate_params(self):
-        """Validate input params. """
+        # For the last layer
+        if with_output_activation:
+            output_activation = ACTIVATIONS[self.out_activation_]
+            activations[i + 1] = output_activation(activations[i + 1])
+
+        return activations
+
+    def _compute_cost_grad(self, layer, n_samples, activations, deltas,
+                           coef_grads, intercept_grads):
+        """Compute the cost gradient for the layer."""
+        coef_grads[layer] = safe_sparse_dot(activations[layer].T,
+                                            deltas[layer]) / n_samples
+        coef_grads[layer] += (self.alpha * self.layers_coef_[layer])
+
+        intercept_grads[layer] = np.mean(deltas[layer], 0)
+
+        return coef_grads, intercept_grads
+
+    def _cost_grad_lbfgs(self, packed_coef_inter, X, y, activations, deltas,
+                         coef_grads, intercept_grads):
+        """Compute the MLP cost  function and its corresponding derivatives
+        with respect to the different parameters given in the initialization.
+
+        Parameters
+        ----------
+        packed_parameters : array-like
+            A vector comprising the  flattened coefficients and intercepts.
+
+        X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            The input data.
+
+        y : array-like, shape (n_samples,)
+            The target values.
+
+        activations: list, length = n_layers - 1
+            The ith index of the list holds the values of the ith layer.
+
+        deltas : list, length = n_layers - 1
+            The ith index of the list holds the difference between the
+            activations of the i + 1 layer and the backpropagated error.
+
+        coef_grad : list, length = n_layers - 1
+            The ith index contains the amount of change used to update the
+            coefficient parameters of the ith layer in an iteration.
+
+        intercept_grads : list, length = n_layers - 1
+            The ith index contains the amount of change used to update the
+            intercept parameters of the ith layer in an iteration.
+
+        Returns
+        -------
+        cost : float
+        grad : array-like, shape (number of nodes of all layers,)
+
+        """
+        self._unpack(packed_coef_inter)
+        cost, coef_grads, intercept_grads = self._backprop(X, y, activations,
+                                                           deltas, coef_grads,
+                                                           intercept_grads)
+        self.n_iter_ += 1
+        grad = _pack(coef_grads, intercept_grads)
+        return cost, grad
+
+    def _backprop(self, X, y, activations, deltas, coef_grads,
+                  intercept_grads):
+        """Compute the MLP cost function and its corresponding derivatives
+        with respect to each parameter: weights and bias vectors.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            The input data.
+
+        y : array-like, shape (n_samples,)
+            The target values.
+
+        activations: list, length = n_layers - 1
+             The ith index of the list holds the values of the ith layer.
+
+        deltas : list, length = n_layers - 1
+            The ith index of the list holds the difference between the
+            activations of the i + 1 layer and the backpropagated error.
+
+        coef_grad : list, length = n_layers - 1
+            The ith index contains the amount of change used to update the
+            coefficient parameters of the ith layer in an iteration.
+
+        intercept_grads : list, length = n_layers - 1
+            The ith index contains the amount of change used to update the
+            intercept parameters of the ith layer in an iteration.
+
+        Returns
+        -------
+        cost : float
+        """
+        n_samples = X.shape[0]
+
+        # Step (1/3): Forward propagate
+        activations = self._forward_pass(activations)
+
+        # Step (2/3): Get cost
+        cost = LOSS_FUNCTIONS[self.loss](y, activations[-1])
+ 
+        # Add L2 regularization term to cost
+        values = np.sum(np.array([np.sum(s ** 2) for s in self.layers_coef_]))
+        cost += (0.5 * self.alpha) * values
+        
+        # Add Sparsity Term (This is for autoencoders)
+        if self.sparsity_param > 0:
+            for i in range(self.n_layers_ - 2, 0, -1):
+                sparsity_param_hat = np.sum(activations[i], 0) / n_samples
+                cost += self.beta * np.sum(binary_KL_divergence(self.sparsity_param,
+                                                                sparsity_param_hat))
+        
+        # Step (3/3): Backward propagate
+        last = self.n_layers_ - 2
+        diff = y - activations[-1]
+
+        deltas[last] = -diff
+        # Compute gradient for the last layer
+        coef_grads, intercept_grads = self._compute_cost_grad(last, n_samples,
+                                                              activations,
+                                                              deltas,
+                                                              coef_grads,
+                                                              intercept_grads)
+        
+        # Iterate over the hidden layers
+        for i in range(self.n_layers_ - 2, 0, -1):
+            deltas[i - 1] = safe_sparse_dot(deltas[i],
+                                            self.layers_coef_[i].T)
+            # For sparse autoencoders
+            if self.sparsity_param > 0:
+                sparsity_param_hat = np.sum(activations[i], 0) / n_samples
+                deltas[i - 1]  += self.beta *((1 - self.sparsity_param) / 
+                                             (1 - sparsity_param_hat)
+                                             - self.sparsity_param / 
+                                             sparsity_param_hat)
+
+            derivative = DERIVATIVES[self.activation]
+            deltas[i - 1] *= derivative(activations[i])
+
+            coef_grads, \
+                intercept_grads = self._compute_cost_grad(i - 1,
+                                                          n_samples,
+                                                          activations,
+                                                          deltas,
+                                                          coef_grads,
+                                                          intercept_grads)
+        #print 'cost2', coef_grads
+        return cost, coef_grads, intercept_grads
+
+    def _fit(self, X, y, incremental=False):
+        # Make sure self.hidden_layer_sizes is a list
+        hidden_layer_sizes = self.hidden_layer_sizes
+        if not hasattr(hidden_layer_sizes, "__iter__"):
+            hidden_layer_sizes = [hidden_layer_sizes]
+        hidden_layer_sizes = list(hidden_layer_sizes)
+
+        # Validate input parameters.
+        if np.any(np.array(hidden_layer_sizes) <= 0):
+            raise ValueError("hidden_layer_sizes must be > 0, got %s." %
+                             hidden_layer_sizes)
         if not isinstance(self.shuffle, bool):
-            raise ValueError("shuffle must be either True or False")
+            raise ValueError("shuffle must be either True or False, got %s." %
+                             self.shuffle)
         if self.max_iter <= 0:
-            raise ValueError("max_iter must be > zero")
+            raise ValueError("max_iter must be > 0, got %s." % self.max_iter)
         if self.alpha < 0.0:
-            raise ValueError("alpha must be >= 0")
-        if self.learning_rate in ("constant", "invscaling"):
-            if self.eta0 <= 0.0:
-                raise ValueError("eta0 must be > 0")
+            raise ValueError("alpha must be >= 0, got %s." % self.alpha)
+        if (self.learning_rate in ["constant", "invscaling"] and
+                self.learning_rate_init <= 0.0):
+            raise ValueError("learning_rate_init must be > 0, got %s." %
+                             self.learning_rate)
 
-        # raises ValueError if not registered
-        if self.activation not in self.activation_functions:
-            raise ValueError("The activation %s"
-                             " is not supported. " % self.activation)
+        # raise ValueError if not registered
+        if self.activation not in ACTIVATIONS:
+            raise ValueError("The activation %s is not supported. Supported "
+                             "activations are %s." % (self.activation,
+                                                      ACTIVATIONS))
         if self.learning_rate not in ["constant", "invscaling"]:
-            raise ValueError("learning rate %s "
-                             " is not supported. " % self.learning_rate)
+            raise ValueError("learning rate %s is not supported. " %
+                             self.learning_rate)
         if self.algorithm not in ["sgd", "l-bfgs"]:
-            raise ValueError("The algorithm %s"
-                             " is not supported. " % self.algorithm)
+            raise ValueError("The algorithm %s is not supported. " %
+                             self.algorithm)
 
-    def _init_fit(self):
-        """Initialize weight and bias parameters."""
-        rng = check_random_state(self.random_state)
+        #X, y = check_X_y(X, y, accept_sparse=['csr', 'csc', 'coo'],
+        #                 multi_output=True)
 
-        self.coef_hidden_ = rng.uniform(
-            -1, 1, (self.n_features, self.n_hidden))
-        self.coef_output_ = rng.uniform(-1, 1, (self.n_hidden, self.n_outputs))
-        self.intercept_hidden_ = rng.uniform(-1, 1, self.n_hidden)
-        self.intercept_output_ = rng.uniform(-1, 1, self.n_outputs)
+        # This outputs a warning when a 1d array is expected
+        #if y.ndim == 2 and y.shape[1] == 1:
+        #    y = column_or_1d(y, warn=True)
 
-    def _init_param(self):
-        """Sets the activation, derivative, loss and output functions."""
-        self.activation_func = self.activation_functions[self.activation]
-        self.derivative_func = self.derivative_functions[self.activation]
+        n_samples, n_features = X.shape
 
-        # output for regression
-        if self.classes_ is None:
-            self.output_func = _identity
-        # output for multi class
-        elif len(self.classes_) > 2 and self.multi_label is False:
-            self.output_func = _softmax
-        # output for binary class and multi-label
+        # Classification
+        if isinstance(self, ClassifierMixin):
+            self.label_binarizer_.fit(y)
+
+            if self.classes_ is None or not incremental:
+                self.classes_ = self.label_binarizer_.classes_
+            else:
+                classes = self.label_binarizer_.classes_
+                if not np.all(np.in1d(classes, self.classes_)):
+                    raise ValueError("`y` has classes not in `self.classes_`."
+                                     " `self.classes_` has %s. 'y' has %s." %
+                                     (self.classes_, classes))
+
+            y = self.label_binarizer_.transform(y)
+
+        # Ensure y is 2D
+        if y.ndim == 1:
+            y = y.reshape((-1, 1))
+
+        self.n_outputs_ = y.shape[1]
+
+        layer_units = ([n_features] + hidden_layer_sizes +
+                       [self.n_outputs_])
+
+        # First time training the model
+        if self.layers_coef_ is None or (not self.warm_start and
+                                         not incremental):
+            # Initialize parameters
+            self.n_iter_ = 0
+            self.t_ = 0
+            self.learning_rate_ = self.learning_rate_init
+            self.n_outputs_ = y.shape[1]
+
+            # Compute the number of layers
+            self.n_layers_ = len(layer_units)
+
+            # Output for regression
+            if not isinstance(self, ClassifierMixin):
+                self.out_activation_ = 'identity'
+            # Output for multi class
+            elif self.label_binarizer_.y_type_ == 'multiclass':
+                self.out_activation_ = 'softmax'
+            # Output for binary class and multi-label
+            else:
+                self.out_activation_ = 'logistic'
+
+            # Initialize coefficient and intercept layers
+            self.layers_coef_ = []
+            self.layers_intercept_ = []
+
+            for i in range(self.n_layers_ - 1):
+                rng = check_random_state(self.random_state)
+
+                n_fan_in = layer_units[i]
+                n_fan_out = layer_units[i + 1]
+
+                # Use the initialization method recommended by
+                # Glorot et al.
+                weight_init_bound = np.sqrt(6. / (n_fan_in + n_fan_out))
+
+                self.layers_coef_.append(rng.uniform(-weight_init_bound,
+                                                     weight_init_bound,
+                                                     (n_fan_in, n_fan_out)))
+                rng = check_random_state(self.random_state)
+                self.layers_intercept_.append(rng.uniform(-weight_init_bound,
+                                                          weight_init_bound,
+                                                          n_fan_out))
+      
+        if self.shuffle:
+            X, y = shuffle(X, y, random_state=self.random_state)
+
+        # l-bfgs does not support mini-batches
+        if self.algorithm == 'l-bfgs':
+            batch_size = n_samples
         else:
-            self.output_func = logistic_sigmoid
+            batch_size = np.clip(self.batch_size, 1, n_samples)
 
-    def _init_t_eta_(self):
-        """Initialize iteration counter attr ``t_``"""
-        self.t_ = 1.0
-        self.eta_ = self.eta0
+        # Initialize lists
+        activations = [X]
+        activations.extend(np.empty((batch_size, n_fan_out))
+                           for n_fan_out in layer_units[1:])
+        deltas = [np.empty_like(a_layer) for a_layer in activations]
 
-    def _preallocate_memory(self, size):
-        """ preallocate memory"""
-        a_hidden = np.empty((size, self.n_hidden))
-        a_output = np.empty((size, self.n_outputs))
-        delta_o = np.empty((size, self.n_outputs))
+        coef_grads = [np.empty((n_fan_in, n_fan_out)) for n_fan_in,
+                      n_fan_out in zip(layer_units[:-1],
+                                       layer_units[1:])]
 
-        return a_hidden, a_output, delta_o
+        intercept_grads = [np.empty(n_fan_out) for n_fan_out in
+                           layer_units[1:]]
+
+        # Run the Stochastic Gradient Descent algorithm
+        if self.algorithm == 'sgd':
+            prev_cost = np.inf
+            cost_increase_count = 0
+
+            for i in range(self.max_iter):
+                for batch_slice in gen_batches(n_samples, batch_size):
+                    activations[0] = X[batch_slice]
+                    self.cost_, coef_grads, intercept_grads = self._backprop(
+                        X[batch_slice], y[batch_slice],
+                        activations, deltas, coef_grads,
+                        intercept_grads)
+
+                    # update weights
+                    for i in range(self.n_layers_ - 1):
+                        self.layers_coef_[i] -= (self.learning_rate_ *
+                                                 coef_grads[i])
+                        self.layers_intercept_[i] -= (self.learning_rate_ *
+                                                      intercept_grads[i])
+
+                    if self.learning_rate == 'invscaling':
+                        self.learning_rate_ = self.learning_rate_init / \
+                            (self.t_ + 1) ** self.power_t
+
+                if incremental is False:
+                    self.n_iter_ += 1
+
+                self.t_ += n_samples
+
+                if self.verbose:
+                    print("Iteration %d, cost = %.8f" % (self.n_iter_,
+                                                         self.cost_))
+
+                if self.cost_ > prev_cost:
+                    cost_increase_count += 1
+                    if cost_increase_count == 0.2 * self.max_iter:
+                        warnings.warn('Cost is increasing for more than 20%%'
+                                      ' of the iterations. Consider reducing'
+                                      ' learning_rate_init and preprocessing'
+                                      ' your data with StandardScaler or '
+                                      ' MinMaxScaler.'
+                                      % self.cost_, ConvergenceWarning)
+
+                elif prev_cost - self.cost_ < self.tol or incremental:
+                    break
+
+                prev_cost = self.cost_
+
+                if self.n_iter_ == self.max_iter:
+                    warnings.warn('SGD: Maximum iterations have reached and'
+                                  ' the optimization hasn\'t converged yet.'
+                                  % (), ConvergenceWarning)
+        # Run the LBFGS algorithm
+        elif self.algorithm == 'l-bfgs':
+            # Store meta information for the parameters
+            self._coef_indptr = []
+            self._intercept_indptr = []
+            start = 0
+
+            # Save sizes and indices of coefficients for faster unpacking
+            for i in range(self.n_layers_ - 1):
+                n_fan_in, n_fan_out = layer_units[i], layer_units[i + 1]
+
+                end = start + (n_fan_in * n_fan_out)
+                self._coef_indptr.append((start, end, (n_fan_in, n_fan_out)))
+                start = end
+
+            # Save sizes and indices of intercepts for faster unpacking
+            for i in range(self.n_layers_ - 1):
+                end = start + layer_units[i + 1]
+                self._intercept_indptr.append((start, end))
+                start = end
+
+            # Run LBFGS
+            packed_coef_inter = _pack(self.layers_coef_,
+                                      self.layers_intercept_)
+
+            if self.verbose is True or self.verbose >= 1:
+                iprint = 1
+            else:
+                iprint = -1
+
+            optimal_parameters, self.cost_, d = fmin_l_bfgs_b(
+                x0=packed_coef_inter,
+                func=self._cost_grad_lbfgs,
+                maxfun=self.max_iter,
+                iprint=iprint,
+                pgtol=self.tol,
+                args=(X, y, activations, deltas, coef_grads, intercept_grads))
+
+            self._unpack(optimal_parameters)
+
+        return self
 
     def fit(self, X, y):
         """Fit the model to the data X and target y.
@@ -234,248 +488,16 @@ class BaseMultilayerPerceptron(six.with_metaclass(ABCMeta, BaseEstimator)):
         Parameters
         ----------
         X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Training data, where n_samples in the number of samples
-            and n_features is the number of features.
+            The input data.
 
-        y : numpy array of shape (n_samples)
-             Subset of the target values.
-
-        Returns
-        -------
-        self
-        """
-        X = atleast2d_or_csr(X)
-
-        self._validate_params()
-
-        n_samples, self.n_features = X.shape
-        self.n_outputs = y.shape[1]
-
-        if not self.warm_start:
-            self._init_t_eta_()
-            self._init_fit()
-            self._init_param()
-        else:
-            if self.t_ is None or self.coef_hidden_ is None:
-                self._init_t_eta_()
-                self._init_fit()
-                self._init_param()
-
-        if self.shuffle:
-            X, y = shuffle(X, y, random_state=self.random_state)
-
-        # l-bfgs does not use mini-batches
-        if self.algorithm == 'l-bfgs':
-            batch_size = n_samples
-        else:
-            batch_size = np.clip(self.batch_size, 0, n_samples)
-            n_batches = n_samples / batch_size
-            batch_slices = list(
-                gen_even_slices(
-                    n_batches * batch_size,
-                    n_batches))
-
-        # preallocate memory
-        a_hidden, a_output, delta_o = self._preallocate_memory(
-            batch_size)
-
-        if self.algorithm == 'sgd':
-            prev_cost = np.inf
-
-            for i in xrange(self.max_iter):
-                for batch_slice in batch_slices:
-                    cost = self._backprop_sgd(
-                        X[batch_slice],
-                        y[batch_slice],
-                        batch_size,
-                        a_hidden,
-                        a_output,
-                        delta_o)
-
-                if self.verbose:
-                    print("Iteration %d, cost = %.2f"
-                          % (i, cost))
-                if abs(cost - prev_cost) < self.tol:
-                    break
-                prev_cost = cost
-                self.t_ += 1
-
-        elif 'l-bfgs':
-            self._backprop_lbfgs(
-                X, y, n_samples, a_hidden,
-                a_output,
-                delta_o)
-
-        return self
-
-    def _backprop(self, X, y, n_samples, a_hidden, a_output, delta_o):
-        """Computes the MLP cost  function
-        and its corresponding derivatives with respect to the
-        different parameters given in the initialization.
-
-        Parameters
-        ----------
-        theta : array-like, shape (size(W1) * size(W2) * size(b1) * size(b2))
-                    A vector comprising the  flattened weights :
-                    "W1, W2, b1, b2"
-
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Training data, where n_samples in the number of samples
-            and n_features is the number of features.
-
-        y : numpy array of shape (n_samples)
-            Subset of the target values.
-
-        n_samples : int
-            Number of samples
+        y : array-like, shape (n_samples,)
+            The target values.
 
         Returns
         -------
-        cost : float
-        grad : array-like, shape (size(W1) * size(W2) * size(b1) * size(b2))
+        self : returns a trained MLP model.
         """
-        # Forward propagate
-        a_hidden[:] = self.activation_func(safe_sparse_dot(X,
-                                                           self.coef_hidden_) +
-                                           self.intercept_hidden_)
-
-        a_output[:] = self.output_func(safe_sparse_dot(a_hidden,
-                                                       self.coef_output_) +
-                                       self.intercept_output_)
-
-        # get cost
-        cost = self.loss_functions[self.loss](y, a_output)
-        # add regularization term to cost
-        cost += (0.5 * self.alpha) * (np.sum(self.coef_hidden_ ** 2) +
-                                      np.sum(self.coef_output_ ** 2)) \
-            / n_samples
-
-        # backward propagate
-        diff = y - a_output
-        delta_o[:] = -diff
-        delta_h = np.dot(delta_o, self.coef_output_.T) *\
-            self.derivative_func(a_hidden)
-
-        # get regularized gradient
-        W1grad = (safe_sparse_dot(X.T,
-                                  delta_h) + (self.alpha *
-                                              self.coef_hidden_)) / n_samples
-        W2grad = (safe_sparse_dot(a_hidden.T,
-                                  delta_o) + (self.alpha *
-                                              self.coef_output_)) / n_samples
-        b1grad = np.mean(delta_h, 0)
-        b2grad = np.mean(delta_o, 0)
-
-        return cost, W1grad, W2grad, b1grad, b2grad
-
-    def _backprop_sgd(
-            self, X, y, n_samples, a_hidden, a_output, delta_o):
-        """Updates the weights using the computed gradients.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Training data, where n_samples in the number of samples
-            and n_features is the number of features.
-
-        y : numpy array of shape (n_samples)
-            Subset of the target values.
-
-        n_samples : int
-            Number of samples.
-
-        """
-        cost, W1grad, W2grad, b1grad, b2grad = self._backprop(
-            X, y, n_samples, a_hidden, a_output, delta_o)
-
-        # Update weights
-        self.coef_hidden_ -= (self.eta_ * W1grad)
-        self.coef_output_ -= (self.eta_ * W2grad)
-        self.intercept_hidden_ -= (self.eta_ * b1grad)
-        self.intercept_output_ -= (self.eta_ * b2grad)
-
-        if self.learning_rate == 'invscaling':
-            self.eta_ = self.eta0 / pow(self.t_, self.power_t)
-
-        return cost
-
-    def _backprop_lbfgs(self, X, y, n_samples,
-                        a_hidden, a_output, delta_o):
-        """Applies the quasi-Newton optimization methods that uses a l_BFGS
-        to train the weights.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Training data, where n_samples in the number of samples
-            and n_features is the number of features.
-
-        y : numpy array of shape (n_samples)
-            Subset of the target values.
-
-        n_samples : int
-            Number of samples.
-
-        """
-        initial_theta = self._pack(
-            self.coef_hidden_,
-            self.coef_output_,
-            self.intercept_hidden_,
-            self.intercept_output_)
-
-        if self.verbose is True or self.verbose >= 1:
-            iprint = 1
-        else:
-            iprint = -1
-
-        optTheta, _, _ = fmin_l_bfgs_b(
-            func=self._cost_grad,
-            x0=initial_theta,
-            maxfun=self.max_iter,
-            iprint=iprint,
-            pgtol=self.tol,
-            args=(
-                X,
-                y,
-                n_samples,
-                a_hidden, a_output, delta_o))
-
-        self._unpack(optTheta)
-
-    def _cost_grad(self, theta, X, y, n_samples, a_hidden, a_output, delta_o):
-        """Computes the MLP cost  function and its
-        corresponding derivatives with respect to the
-        different parameters given in the initialization.
-
-        Parameters
-        ----------
-        theta : array-like, shape (size(W1) * size(W2) * size(b1) * size(b2))
-                    A vector comprising the  flattened weights :
-                    "W1, W2, b1, b2"
-
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Training data, where n_samples in the number of samples
-            and n_features is the number of features.
-
-        y : numpy array of shape (n_samples)
-            Subset of the target values.
-
-        n_samples : int
-            Number of samples.
-
-        Returns
-        -------
-        cost : float
-        grad : array-like, shape (size(W1) * size(W2) * size(b1) * size(b2))
-
-        """
-        self._unpack(theta)
-
-        cost, W1grad, W2grad, b1grad, b2grad = self._backprop(
-            X, y, n_samples, a_hidden, a_output, delta_o)
-        grad = self._pack(W1grad, W2grad, b1grad, b2grad)
-
-        return cost, grad
+        return self._fit(X, y, incremental=False)
 
     def partial_fit(self, X, y):
         """Fit the model to the data X and target y.
@@ -483,96 +505,88 @@ class BaseMultilayerPerceptron(six.with_metaclass(ABCMeta, BaseEstimator)):
         Parameters
         ----------
         X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Subset of training data.
+            The input data.
 
-        y : numpy array of shape (n_samples)
-            Subset of target values.
+        y : array-like, shape (n_samples,)
+            The target values.
 
         Returns
         -------
-        self : returns an instance of self.
+        self : returns a trained MLP model.
         """
-        X = atleast2d_or_csr(X)
+        if self.algorithm != 'sgd':
+            raise ValueError("only SGD algorithm supports partial fit")
 
-        self.n_outputs = y.shape[1]
+        return self._fit(X, y, incremental=True)
 
-        n_samples, self.n_features = X.shape
-        self._validate_params()
-
-        if self.coef_hidden_ is None:
-            self._init_fit()
-            self._init_param()
-
-        if self.t_ is None or self.eta_ is None:
-            self._init_t_eta_()
-
-        a_hidden, a_output, delta_o = self._preallocate_memory(n_samples)
-
-        cost = self._backprop_sgd(X, y, n_samples, a_hidden, a_output, delta_o)
-        if self.verbose:
-            print("Iteration %d, cost = %.2f" % (self.t_, cost))
-        self.t_ += 1
-
-        return self
-
-    def decision_function(self, X):
-        """Fit the model to the data X and target y.
+    def _decision_scores(self, X):
+        """Predict using the trained model
 
         Parameters
         ----------
         X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            The input data.
 
         Returns
         -------
-        array, shape (n_samples)
-        Predicted target values per element in X.
+        y_pred : array-like, shape (n_samples,) or (n_samples, n_outputs)
+            The predicted values.
         """
-        X = atleast2d_or_csr(X)
+        #X = check_array(X, accept_sparse=['csr', 'csc', 'coo'])
 
-        a_hidden = self.activation_func(safe_sparse_dot(X, self.coef_hidden_) +
-                                        self.intercept_hidden_)
-        output = safe_sparse_dot(a_hidden, self.coef_output_) +\
-            self.intercept_output_
-        if output.shape[1] == 1:
-            output = output.ravel()
+        # Make sure self.hidden_layer_sizes is a list
+        hidden_layer_sizes = self.hidden_layer_sizes
+        if not hasattr(hidden_layer_sizes, "__iter__"):
+            hidden_layer_sizes = [hidden_layer_sizes]
+        hidden_layer_sizes = list(hidden_layer_sizes)
 
-        return output
+        layer_units = [X.shape[1]] + hidden_layer_sizes + \
+            [self.n_outputs_]
+
+        # Initialize layers
+        activations = []
+        activations.append(X)
+
+        for i in range(self.n_layers_ - 1):
+            activations.append(np.empty((X.shape[0],
+                                         layer_units[i + 1])))
+        # forward propagate
+        self._forward_pass(activations, with_output_activation=False)
+        y_pred = activations[-1]
+
+        return y_pred
 
 
 class MultilayerPerceptronClassifier(BaseMultilayerPerceptron,
                                      ClassifierMixin):
+    """Multi-layer Perceptron classifier.
 
-    """Multi-layer perceptron (feedforward neural network) classifier.
-
-    Trained with gradient descent under the loss function which is estimated
-    for each sample batch at a time and the model is updated along the way
-    with a decreasing strength schedule (aka learning rate).
-
-    Please note that this implementation uses one hidden layer only.
-
-    The regularizer is a penalty added to the loss function that shrinks model
-    parameters towards the zero vector.
-
-    This implementation works with data represented as dense and sparse numpy
-    arrays of floating point values for the features.
+    This algorithm optimizes the logistic loss function using l-bfgs or
+    gradient descent.
 
     Parameters
     ----------
-    n_hidden : int, default 100
-        Number of units in the hidden layer.
+    hidden_layer_sizes : tuple, length = n_layers - 2, default (100,)
+        The ith index in list contains the number of neurons in the ith
+        hidden layer.
 
-    activation : {'logistic', 'tanh'}, default 'logistic'
+    activation : {'logistic', 'tanh', 'relu'}, default 'relu'
         Activation function for the hidden layer.
 
-         - 'logistic' for 1 / (1 + exp(x)).
+        -  'logistic', the logistic sigmoid function,
+            returns f(x) = 1 / (1 + exp(x)).
 
-         - 'tanh' for the hyperbolic tangent.
+        - 'tanh', the hyperbolic tan function,
+           returns f(x) = tanh(x).
+
+        - 'relu', the rectified linear unit function,
+           returns f(x) = max(0, x)
 
     algorithm : {'l-bfgs', 'sgd'}, default 'l-bfgs'
         The algorithm for weight optimization.  Defaults to 'l-bfgs'
 
-        - 'l-bfgs' is an optimization algorithm in the family of quasi-
-           Newton methods.
+        - 'l-bfgs' is an optimization algorithm in the family of
+          quasi-Newton methods.
 
         - 'sgd' refers to stochastic gradient descent.
 
@@ -587,12 +601,13 @@ class MultilayerPerceptronClassifier(BaseMultilayerPerceptron,
     learning_rate : {'constant', 'invscaling'}, default 'constant'
         Base learning rate for weight updates.
 
-        -'constant', as it stands,  keeps the learning rate 'eta' constant
-          throughout training. eta = eta0
+        -'constant', as it stands,  keeps the learning rate
+         'learning_rate_init' constant throughout training.
+         learning_rate_ = learning_rate_init
 
-        -'invscaling' gradually decreases the learning rate 'eta' at each
-          time step 't' using an inverse scaling exponent of'power_t'.
-          eta = eta0 / pow(t, power_t)
+        -'invscaling' gradually decreases the learning rate 'learning_rate_' at
+          each time step 't' using an inverse scaling exponent of 'power_t'.
+          learning_rate_ = learning_rate_init / pow(t, power_t)
 
     max_iter : int, optional, default 200
         Maximum number of iterations. The algorithm
@@ -611,13 +626,13 @@ class MultilayerPerceptronClassifier(BaseMultilayerPerceptron,
         less than this amount from that at iteration i, convergence is
         considered to be reached and the algorithm exits.
 
-    eta0 : double, optional, default 0.5
+    learning_rate_init : double, optional, default 0.5
         The initial learning rate used. It controls the step-size
         in updating the weights.
 
-    power_t : double, optional, default 0.25
+    power_t : double, optional, default 0.5
         The exponent for inverse scaling learning rate.
-        It is used in updating eta0 when the learning_rate
+        It is used in updating learning_rate_init when the learning_rate
         is set to 'invscaling'.
 
     verbose : bool, optional, default False
@@ -627,58 +642,119 @@ class MultilayerPerceptronClassifier(BaseMultilayerPerceptron,
         When set to True, reuse the solution of the previous
         call to fit as initialization, otherwise, just erase the
         previous solution.
+
+    Attributes
+    ----------
+    `classes_` : array or list of array of shape (n_classes,)
+        Class labels for each output.
+
+    `cost_` : float
+        The current cost value computed by the loss function.
+
+    `label_binarizer_` : LabelBinarizer
+        A LabelBinarizer object trained on the training set.
+
+    `layers_coef_` : list, length n_layers - 1
+        The ith element in the list represents the weight matrix corresponding
+        to layer i.
+
+    `layers_intercept_` : list, length n_layers - 1
+        The ith element in the list represents the bias vector corresponding to
+        layer i + 1.
+
+    `learning_rate_` : float
+        The current learning rate.
+
+    n_iter_ : int,
+        The current number of iterations the algorithm has ran.
+
+    n_layers_ : int
+        Number of layers.
+
+    `n_outputs_` : int
+        Number of outputs.
+
+    `out_activation_` : string
+        Name of the output activation function.
+
+    Notes
+    -----
+    MultilayerPerceptronClassifier trains iteratively since at each time step
+    the partial derivatives of the loss function with respect to the model
+    parameters are computed to update the parameters.
+
+    It can also use regularizer as a penalty term added to the loss function
+    that shrinks model parameters towards zero.
+
+    This implementation works with data represented as dense and sparse numpy
+    arrays of floating point values for the features.
+
+    References
+    ----------
+    Hinton, Geoffrey E.
+        "Connectionist learning procedures." Artificial intelligence 40.1
+        (1989): 185-234.
+
+    Glorot, Xavier, and Yoshua Bengio. "Understanding the difficulty of
+        training deep feedforward neural networks." International Conference
+        on Artificial Intelligence and Statistics. 2010.
     """
-    def __init__(
-            self, n_hidden=100, activation="logistic",
-            algorithm='l-bfgs', alpha=0.00001,
-            batch_size=200, learning_rate="constant", eta0=0.5,
-            power_t=0.25, max_iter=200, shuffle=False,
-            random_state=None, tol=1e-5,
-            verbose=False, warm_start=False):
+    def __init__(self, hidden_layer_sizes=(100,), activation="relu",
+                 algorithm='l-bfgs', alpha=0.00001,
+                 batch_size=200, learning_rate="constant",
+                 learning_rate_init=0.5, power_t=0.5, max_iter=200,
+                 shuffle=False, random_state=None, tol=1e-5,
+                 verbose=False, warm_start=False):
 
         sup = super(MultilayerPerceptronClassifier, self)
-        sup.__init__(n_hidden, activation,
-                     algorithm, alpha,
-                     batch_size, learning_rate,
-                     eta0, power_t,
-                     max_iter, shuffle,
-                     random_state,
-                     tol, verbose,
-                     warm_start)
+        sup.__init__(hidden_layer_sizes=hidden_layer_sizes,
+                     activation=activation, algorithm=algorithm, alpha=alpha,
+                     batch_size=batch_size, learning_rate=learning_rate,
+                     learning_rate_init=learning_rate_init, power_t=power_t,
+                     max_iter=max_iter, loss='log_loss', shuffle=shuffle,
+                     random_state=random_state, tol=tol,
+                     beta=0, sparsity_param=0,
+                     verbose=verbose, warm_start=warm_start)
 
-        self.loss = 'log_loss'
-        self.classes_ = None
+        self.label_binarizer_ = LabelBinarizer()
 
-    def fit(self, X, y):
-        """Fit the model to the data X and target y.
+    def decision_function(self, X):
+        """Decision function of the elm model
 
         Parameters
         ----------
         X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Training data, where n_samples in the number of samples
-            and n_features is the number of features.
-
-        y : numpy array of shape (n_samples)
+            The input data.
 
         Returns
         -------
-        self
+        y : array-like, shape (n_samples,) or (n_samples, n_classes)
+            The predicted values.
         """
-        y = column_or_1d(y, warn=True)
+        y_scores = self._decision_scores(X)
 
-        # needs a better way to check multi-label instances
-        if isinstance(np.reshape(y, (-1, 1))[0][0], list):
-            self.multi_label = True
+        if self.n_outputs_ == 1:
+            return y_scores.ravel()
         else:
-            self.multi_label = False
+            return y_scores
 
-        self.classes_ = np.unique(y)
-        self._lbin = LabelBinarizer()
-        y = self._lbin.fit_transform(y)
+    def predict(self, X):
+        """Predict using the extreme learning machines model
 
-        super(MultilayerPerceptronClassifier, self).fit(X, y)
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            The input data.
 
-        return self
+        Returns
+        -------
+        y : array-like, shape (n_samples,) or (n_samples, n_classes)
+            The predicted classes, or the predicted values.
+        """
+        y_scores = self.decision_function(X)
+        y_scores = ACTIVATIONS[self.out_activation_](y_scores)
+
+        return self.label_binarizer_.inverse_transform(y_scores)
 
     def partial_fit(self, X, y, classes=None):
         """Fit the model to the data X and target y.
@@ -686,8 +762,10 @@ class MultilayerPerceptronClassifier(BaseMultilayerPerceptron,
         Parameters
         ----------
         X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Training data, where n_samples in the number of samples
-            and n_features is the number of features.
+            The input data.
+
+        y : array-like, shape (n_samples,)
+            The predicted values.
 
         classes : array, shape (n_classes)
             Classes across all calls to partial_fit.
@@ -697,87 +775,33 @@ class MultilayerPerceptronClassifier(BaseMultilayerPerceptron,
             and can be omitted in the subsequent calls.
             Note that y doesn't need to contain all labels in `classes`.
 
-        y : numpy array of shape (n_samples)
-             Subset of the target values.
-
         Returns
         -------
-        self
+        self : returns a trained MLP model.
         """
-        if self.algorithm != 'sgd':
-            raise ValueError("only SGD algorithm"
-                             " supports partial fit")
+        self.classes_ = classes
 
-        if self.classes_ is None and classes is None:
-            raise ValueError("classes must be passed on the first call "
-                             "to partial_fit.")
-        elif self.classes_ is not None and classes is not None:
-            if np.any(self.classes_ != np.unique(classes)):
-                raise ValueError("`classes` is not the same as on last call "
-                                 "to partial_fit.")
-        elif classes is not None:
-            self.classes_ = classes
-
-        if not hasattr(self, '_lbin'):
-            self._lbin = LabelBinarizer()
-            self._lbin._classes = classes
-
-        y = column_or_1d(y, warn=True)
-
-        # needs a better way to check multi-label instances
-        if isinstance(np.reshape(y, (-1, 1))[0][0], list):
-            self.multi_label = True
-        else:
-            self.multi_label = False
-
-        y = self._lbin.fit_transform(y)
         super(MultilayerPerceptronClassifier, self).partial_fit(X, y)
 
         return self
 
-    def predict(self, X):
-        """Predict using the multi-layer perceptron model
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
-
-        Returns
-        -------
-        array, shape (n_samples)
-            Predicted target values per element in X.
-        """
-        X = atleast2d_or_csr(X)
-        scores = self.decision_function(X)
-
-        if len(scores.shape) == 1 or self.multi_label is True:
-            scores = logistic_sigmoid(scores)
-            results = (scores > 0.5).astype(np.int)
-
-            if self.multi_label:
-                return self._lbin.inverse_transform(results)
-
-        else:
-            scores = _softmax(scores)
-            results = scores.argmax(axis=1)
-
-        return self.classes_[results]
-
     def predict_log_proba(self, X):
-        """Returns the log of probability estimates.
+        """Return the log of probability estimates.
 
         Parameters
         ----------
         X : array-like, shape (n_samples, n_features)
+            The input data.
 
         Returns
         -------
-        T : array-like, shape (n_samples, n_outputs)
-            Returns the log-probability of the sample for each class in the
-            model, where classes are ordered as they are in
+        y_prob : array-like, shape (n_samples, n_classes)
+            The predicted log-probability of the sample for each class
+            in the model, where classes are ordered as they are in
             `self.classes_`. Equivalent to log(predict_proba(X))
         """
-        return np.log(self.predict_proba(X))
+        y_prob = self.predict_proba(X)
+        return np.log(y_prob, out=y_prob)
 
     def predict_proba(self, X):
         """Probability estimates.
@@ -785,54 +809,52 @@ class MultilayerPerceptronClassifier(BaseMultilayerPerceptron,
         Parameters
         ----------
         X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            The input data.
 
         Returns
         -------
-        array, shape (n_samples, n_outputs)
-            Returns the probability of the sample for each class in the model,
-            where classes are ordered as they are in `self.classes_`.
+        y_prob : array-like, shape (n_samples, n_classes)
+            The predicted probability of the sample for each class in the
+            model, where classes are ordered as they are in `self.classes_`.
         """
-        scores = self.decision_function(X)
+        y_scores = self.decision_function(X)
 
-        if len(scores.shape) == 1:
-            scores = logistic_sigmoid(scores)
-            return np.vstack([1 - scores, scores]).T
+        if y_scores.ndim == 1:
+            y_scores = logistic(y_scores)
+            return np.vstack([1 - y_scores, y_scores]).T
         else:
-            return _softmax(scores)
+            return softmax(y_scores)
 
 
 class MultilayerPerceptronRegressor(BaseMultilayerPerceptron, RegressorMixin):
-    """Multi-layer perceptron (feedforward neural network) classifier.
+    """Multi-layer Perceptron regressor.
 
-    Trained with gradient descent under the loss function which is estimated
-    for each sample batch at a time and the model is updated along the way
-    with a decreasing strength schedule (aka learning rate).
-
-    Please note that this implementation uses one hidden layer only.
-
-    The regularizer is a penalty added to the loss function that shrinks model
-    parameters towards the zero vector.
-
-    This implementation works with data represented as dense and sparse numpy
-    arrays of floating point values for the features.
+    This algorithm optimizes the squared-err loss function using l-bfgs or
+    gradient descent.
 
     Parameters
     ----------
-    n_hidden : int, default 100
-        Number of units in the hidden layer.
+    hidden_layer_sizes : tuple, length = n_layers - 2, default (100,)
+        The ith index in list contains the number of neurons in the ith
+        hidden layer.
 
-    activation : {'logistic', 'tanh'}, default 'logistic'
+    activation : {'logistic', 'tanh', 'relu'}, default 'relu'
         Activation function for the hidden layer.
 
-         - 'logistic' for 1 / (1 + exp(x)).
+        - 'logistic', the logistic sigmoid function,
+           returns f(x) = 1 / (1 + exp(x)).
 
-         - 'tanh' for the hyperbolic tangent.
+        - 'tanh', the hyperbolic tan function,
+           returns f(x) = tanh(x).
+
+        - 'relu', the rectified linear unit function,
+           returns f(x) = max(0, x)
 
     algorithm : {'l-bfgs', 'sgd'}, default 'l-bfgs'
         The algorithm for weight optimization.  Defaults to 'l-bfgs'
 
-        - 'l-bfgs' is an optimization algorithm in the family of quasi-
-           Newton methods.
+        - 'l-bfgs' is an optimization algorithm in the family of
+          quasi-Newton methods.
 
         - 'sgd' refers to stochastic gradient descent.
 
@@ -847,12 +869,13 @@ class MultilayerPerceptronRegressor(BaseMultilayerPerceptron, RegressorMixin):
     learning_rate : {'constant', 'invscaling'}, default 'constant'
         Base learning rate for weight updates.
 
-        -'constant', as it stands,  keeps the learning rate 'eta' constant
-          throughout training. eta = eta0
+        -'constant', as it stands,  keeps the learning rate
+         'learning_rate_init' constant throughout training.
+         learning_rate_ = learning_rate_init
 
-        -'invscaling' gradually decreases the learning rate 'eta' at each
-          time step 't' using an inverse scaling exponent of'power_t'.
-          eta = eta0 / pow(t, power_t)
+        -'invscaling' gradually decreases the learning rate 'learning_rate_' at
+          each time step 't' using an inverse scaling exponent of 'power_t'.
+          learning_rate_ = learning_rate_init / pow(t, power_t)
 
     max_iter : int, optional, default 200
         Maximum number of iterations. The algorithm
@@ -871,13 +894,13 @@ class MultilayerPerceptronRegressor(BaseMultilayerPerceptron, RegressorMixin):
         less than this amount from that at iteration i, convergence is
         considered to be reached and the algorithm exits.
 
-    eta0 : double, optional, default 0.1
+    learning_rate_init : double, optional, default 0.5
         The initial learning rate used. It controls the step-size
         in updating the weights.
 
-    power_t : double, optional, default 0.25
+    power_t : double, optional, default 0.5
         The exponent for inverse scaling learning rate.
-        It is used in updating eta0 when the learning_rate
+        It is used for updating learning_rate_ when it
         is set to 'invscaling'.
 
     verbose : bool, optional, default False
@@ -887,75 +910,74 @@ class MultilayerPerceptronRegressor(BaseMultilayerPerceptron, RegressorMixin):
         When set to True, reuse the solution of the previous
         call to fit as initialization, otherwise, just erase the
         previous solution.
+
+    Attributes
+    ----------
+    `cost_` : float
+        The current cost value computed by the loss function.
+
+    `layers_coef_` : list, length n_layers - 1
+        The ith element in the list represents the weight matrix corresponding
+        to layer i.
+
+    `layers_intercept_` : list, length n_layers - 1
+        The ith element in the list represents the bias vector corresponding to
+        layer i + 1.
+
+    `learning_rate_` : float
+        The current learning rate.
+
+    n_iter_ : int,
+        The current number of iterations the algorithm has ran.
+
+    n_layers_ : int
+        Number of layers.
+
+    `n_outputs_` : int
+        Number of outputs.
+
+    `out_activation_` : string
+        Name of the output activation function.
+
+    Notes
+    -----
+    MultilayerPerceptronRegressor trains iteratively since at each time step
+    the partial derivatives of the loss function with respect to the model
+    parameters are computed to update the parameters.
+
+    It can also use regularizer as a penalty term added to the loss function
+    that shrinks model parameters towards zero.
+
+    This implementation works with data represented as dense and sparse numpy
+    arrays of floating point values for the features.
+
+    References
+    ----------
+    Hinton, Geoffrey E.
+        "Connectionist learning procedures." Artificial intelligence 40.1
+        (1989): 185-234.
+
+    Glorot, Xavier, and Yoshua Bengio. "Understanding the difficulty of
+        training deep feedforward neural networks." International Conference
+        on Artificial Intelligence and Statistics. 2010.
     """
-    def __init__(
-            self, n_hidden=100, activation="logistic",
-            algorithm='l-bfgs', alpha=0.00001,
-            batch_size=200, learning_rate="constant", eta0=0.1,
-            power_t=0.25, max_iter=100, shuffle=False,
-            random_state=None, tol=1e-5,
-            verbose=False, warm_start=False):
+    def __init__(self, hidden_layer_sizes=(100,), activation="relu",
+                 algorithm='l-bfgs', alpha=0.00001,
+                 batch_size=200, learning_rate="constant",
+                 learning_rate_init=0.1,
+                 power_t=0.5, max_iter=100, shuffle=False,
+                 random_state=None, tol=1e-5,
+                 verbose=False, warm_start=False):
 
         sup = super(MultilayerPerceptronRegressor, self)
-        sup.__init__(n_hidden, activation,
-                     algorithm, alpha,
-                     batch_size, learning_rate,
-                     eta0, power_t,
-                     max_iter, shuffle,
-                     random_state,
-                     tol, verbose,
-                     warm_start)
-
-        self.loss = 'squared_loss'
-        self.classes_ = None
-
-    def fit(self, X, y):
-        """Fit the model to the data X and target y.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Training data, where n_samples in the number of samples
-            and n_features is the number of features.
-
-        y : numpy array of shape (n_samples)
-            Subset of the target values.
-
-        Returns
-        -------
-        self
-        """
-        y = np.atleast_1d(y)
-
-        if y.ndim == 1:
-            y = np.reshape(y, (-1, 1))
-
-        super(MultilayerPerceptronRegressor, self).fit(X, y)
-        return self
-
-    def partial_fit(self, X, y):
-        """Fit the model to the data X and target y.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Training data, where n_samples in the number of samples
-            and n_features is the number of features.
-
-        y : numpy array of shape (n_samples)
-            Subset of the target values.
-
-        Returns
-        -------
-        self
-        """
-        y = np.atleast_1d(y)
-
-        if y.ndim == 1:
-            y = np.reshape(y, (-1, 1))
-
-        super(MultilayerPerceptronRegressor, self).partial_fit(X, y)
-        return self
+        sup.__init__(hidden_layer_sizes=hidden_layer_sizes,
+                     activation=activation, algorithm=algorithm, alpha=alpha,
+                     batch_size=batch_size, learning_rate=learning_rate,
+                     learning_rate_init=learning_rate_init, power_t=power_t,
+                     max_iter=max_iter, loss='squared_loss', shuffle=shuffle,
+                     random_state=random_state, tol=tol,
+                     beta=0, sparsity_param=0,
+                     verbose=verbose, warm_start=warm_start)
 
     def predict(self, X):
         """Predict using the multi-layer perceptron model.
@@ -963,12 +985,228 @@ class MultilayerPerceptronRegressor(BaseMultilayerPerceptron, RegressorMixin):
         Parameters
         ----------
         X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            The input data.
 
         Returns
         -------
-        array, shape (n_samples)
-            Predicted target values per element in X.
+        y : array-like, shape (n_samples, n_outputs)
+            The predicted values.
         """
-        X = atleast2d_or_csr(X)
+        return self._decision_scores(X)
 
-        return self.decision_function(X)
+
+class MultilayerPerceptronAutoencoder(BaseMultilayerPerceptron, TransformerMixin):
+    """Multi-layer Perceptron autoencoder.
+
+    This algorithm optimizes the square-error loss function using l-bfgs or
+    gradient descent for feature extraction.
+
+    Parameters
+    ----------
+    hidden_layer_sizes : tuple, length = n_layers - 2, default (100,)
+        The ith index in list contains the number of neurons in the ith
+        hidden layer.
+
+    activation : {'logistic', 'tanh', 'relu'}, default 'relu'
+        Activation function for the hidden layer.
+
+        - 'logistic', the logistic sigmoid function,
+           returns f(x) = 1 / (1 + exp(x)).
+
+        - 'tanh', the hyperbolic tan function,
+           returns f(x) = tanh(x).
+
+        - 'relu', the rectified linear unit function,
+           returns f(x) = max(0, x)
+
+    algorithm : {'l-bfgs', 'sgd'}, default 'l-bfgs'
+        The algorithm for weight optimization.  Defaults to 'l-bfgs'
+
+        - 'l-bfgs' is an optimization algorithm in the family of
+          quasi-Newton methods.
+
+        - 'sgd' refers to stochastic gradient descent.
+
+    beta : float, default 3
+        Weight of sparsity penalty term
+        
+    sparsity_param : float, default 0.1
+        Desired average activation of the hidden units
+
+    batch_size : int, optional, default 200
+        Size of minibatches in SGD optimizer.
+        If you select the algorithm as 'l-bfgs',
+        then the classifier will not use minibatches.
+
+    learning_rate : {'constant', 'invscaling'}, default 'constant'
+        Base learning rate for weight updates.
+
+        -'constant', as it stands,  keeps the learning rate
+         'learning_rate_init' constant throughout training.
+         learning_rate_ = learning_rate_init
+
+        -'invscaling' gradually decreases the learning rate 'learning_rate_' at
+          each time step 't' using an inverse scaling exponent of 'power_t'.
+          learning_rate_ = learning_rate_init / pow(t, power_t)
+
+    max_iter : int, optional, default 200
+        Maximum number of iterations. The algorithm
+        iterates until convergence (determined by 'tol') or
+        this number of iterations.
+
+    random_state : int or RandomState, optional, default None
+        State of or seed for random number generator.
+
+    shuffle : bool, optional, default False
+        Whether to shuffle samples in each iteration before extracting
+        minibatches.
+
+    tol : float, optional, default 1e-5
+        Tolerance for the optimization. When the loss at iteration i+1 differs
+        less than this amount from that at iteration i, convergence is
+        considered to be reached and the algorithm exits.
+
+    learning_rate_init : double, optional, default 0.5
+        The initial learning rate used. It controls the step-size
+        in updating the weights.
+
+    power_t : double, optional, default 0.5
+        The exponent for inverse scaling learning rate.
+        It is used for updating learning_rate_ when it
+        is set to 'invscaling'.
+
+    verbose : bool, optional, default False
+        Whether to print progress messages to stdout.
+
+    warm_start : bool, optional, default False
+        When set to True, reuse the solution of the previous
+        call to fit as initialization, otherwise, just erase the
+        previous solution.
+
+    Attributes
+    ----------
+    `cost_` : float
+        The current cost value computed by the loss function.
+
+    `layers_coef_` : list, length n_layers - 1
+        The ith element in the list represents the weight matrix corresponding
+        to layer i.
+
+    `layers_intercept_` : list, length n_layers - 1
+        The ith element in the list represents the bias vector corresponding to
+        layer i + 1.
+
+    `learning_rate_` : float
+        The current learning rate.
+
+    n_iter_ : int,
+        The current number of iterations the algorithm has ran.
+
+    n_layers_ : int
+        Number of layers.
+
+    `n_outputs_` : int
+        Number of outputs.
+
+    `out_activation_` : string
+        Name of the output activation function.
+
+    References
+    ----------
+    Ngiam, Jiquan, et al. 
+        "On optimization methods for deep learning."
+        http://ai.stanford.edu/~quocle/LeNgiCoaLahProNg11.pdf
+    """
+    def __init__(self, hidden_layer_sizes=(100,),
+                 algorithm='l-bfgs', batch_size=200, learning_rate="constant",
+                 learning_rate_init=0.5, alpha=3e-3,
+                 power_t=0.5, max_iter=100, shuffle=False,
+                 random_state=None, tol=1e-5,
+                 beta=3, sparsity_param=0.1,
+                 verbose=False, warm_start=False):
+
+        sup = super(MultilayerPerceptronAutoencoder, self)
+        sup.__init__(hidden_layer_sizes=hidden_layer_sizes,
+                     activation='logistic', algorithm=algorithm, alpha=alpha,
+                     batch_size=batch_size, beta=beta, sparsity_param=sparsity_param,
+                     learning_rate=learning_rate,
+                     learning_rate_init=learning_rate_init, power_t=power_t,
+                     max_iter=max_iter, loss='squared_loss', shuffle=shuffle,
+                     random_state=random_state, tol=tol,
+                     verbose=verbose, warm_start=warm_start)
+
+    def transform(self, X, layer=1):
+        """
+        Computes the extracted features.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+
+        Returns
+        -------
+        h : array-like, shape (n_samples, n_components)
+        """
+        hidden_layer_sizes = self.hidden_layer_sizes
+        if not hasattr(hidden_layer_sizes, "__iter__"):
+            hidden_layer_sizes = [hidden_layer_sizes]
+        hidden_layer_sizes = list(hidden_layer_sizes)
+
+        layer_units = [X.shape[1]] + hidden_layer_sizes + \
+            [self.n_outputs_]
+
+        # Initialize layers
+        activations = []
+        activations.append(X)
+
+        for i in range(self.n_layers_ - 1):
+            activations.append(np.empty((X.shape[0],
+                                         layer_units[i + 1])))
+        # forward propagate
+        self._forward_pass(activations, with_output_activation=False)
+        
+
+        return activations[layer]
+
+    def fit_transform(self, X, X_bar=None):
+        """
+        Fit the model to the data X and transform it.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Training data, where n_samples in the number of samples
+            and n_features is the number of features.
+        """
+        self.fit(X)
+        return self.transform(X)
+
+    def fit(self, X, X_bar=None):
+        """
+        Fit the model to the data X and transform it.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Training data, where n_samples in the number of samples
+            and n_features is the number of features.
+        """
+        if X_bar is None:
+            X_bar = X.copy()
+
+        super(MultilayerPerceptronAutoencoder, self).fit(X, X_bar)
+
+    def predict(self, X):
+        """Predict using the multi-layer perceptron model.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            The input data.
+
+        Returns
+        -------
+        y : array-like, shape (n_samples, n_outputs)
+            The predicted values.
+        """
+        return self._decision_scores(X)
