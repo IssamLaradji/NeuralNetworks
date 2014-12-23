@@ -15,6 +15,3 @@ To be uploaded soon,
   + Extreme Learning Machines
 
   + Convolutional Neural Network (in draft mode)
-
-
-More will be uploaded soon!
