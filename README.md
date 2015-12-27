@@ -1,17 +1,11 @@
 Neural Network Toolbox
 ======================
 
+This repository contains neural networks implemented in Theano. Theano is a great optimization library that can compile
+functions and their gradients. It can also harness the GPU processing power if Theano is configured correctly.
 
-This is a repository containing several state-of-the-art methods in the field of Neural Networks. Inspired by 
-scikit-learn style - http://scikit-learn.org/stable/modules/, the code files are easy-to-use and 
-flexible to different datasets. Each folder hosts one algorithm with an example file demonstraing its usage. 
+The repository `neural_network_theano` can be used in a similar way as scikit-learn. But since neural networks
+can have different layers and update rules, initializing them is just a bit more complicated.
 
-Current available algorithms,
+`examples.py` shows how to initialize a classification and a regression model and train them on different datasets.
 
-  + Multi-layer Perceptron (contains classifier, regressor and sparse auto-encoder)
-
-To be uploaded soon,
-
-  + Extreme Learning Machines
-
-  + Convolutional Neural Network (in draft mode)
