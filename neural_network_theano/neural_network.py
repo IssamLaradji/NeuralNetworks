@@ -14,6 +14,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.externals import six
 from sklearn.preprocessing import LabelBinarizer
 
+from neural_network_theano.layer_classes import fully_connected_layer, convolutional_layer
 from neural_network_theano.layer_classes import square_loss, logistic_loss
 from update_rules import sgd_class
 
@@ -46,14 +47,32 @@ class BaseNeuralNetwork(six.with_metaclass(ABCMeta, BaseEstimator)):
         output = A
         n_output = n_features
 
+        # 1. Construct layers
         for layer in self.layers:
-            layer.construct(X=output, n_input=n_output)
+            if isinstance(layer, fully_connected_layer):
+                layer.construct(X=output, n_input=n_output)
 
-            output = layer.output
-            n_output = layer.n_outputs
-            self.param_list += layer.params
+                output = layer.output
+                n_output = layer.n_outputs
+                self.param_list += layer.params
 
+            elif isinstance(layer, convolutional_layer):
+                n_dim = int(np.sqrt(X.shape[1]))
+                assert n_dim**2 == X.shape[1]
+                image_shape = (self.batch_size, 1, n_dim, n_dim)
+                output = A.reshape(image_shape)
 
+                layer.construct(X=output, n_input_kernels=1, image_shape=image_shape)
+
+                output = layer.output
+                output = output.flatten(2)
+                n_output = layer.n_outputs
+                self.param_list += layer.params
+
+            else:
+                raise("Class not implemented!")
+
+        # 2. Set loss function
         if self.loss_function == "square_loss":
             loss_class = square_loss()
         elif self.loss_function == "logistic_loss":
@@ -62,12 +81,13 @@ class BaseNeuralNetwork(six.with_metaclass(ABCMeta, BaseEstimator)):
         loss_class.construct(output, b, n_input=n_output, n_output=self.n_outputs_)
 
         self.param_list += loss_class.params
+
         loss = loss_class.loss_function
 
         self._predict = theano.function([A], loss_class.y_pred, mode='FAST_RUN')
         self._compute_loss = theano.function([A, b], loss, mode='FAST_RUN')
 
-        # Train Network
+        # 3. Train Network
 
         # (1) Get gradient derivatives
         gparams = [T.grad(loss, param) for param in self.param_list]
@@ -111,7 +131,7 @@ class NeuralNetworkClassifier(BaseNeuralNetwork, ClassifierMixin):
                  update_algorithm="sgd", verbose="False"):
 
         sup = super(NeuralNetworkClassifier, self)
-        sup.__init__(layers=[], loss_function=loss_function, learning_rate=learning_rate,
+        sup.__init__(layers=layers, loss_function=loss_function, learning_rate=learning_rate,
                      batch_size=batch_size, max_epcohs=max_epochs, update_algorithm=update_algorithm,
                      verbose=verbose)
 
@@ -135,7 +155,7 @@ class NeuralNetworkRegressor(BaseNeuralNetwork, RegressorMixin):
                  update_algorithm="sgd", verbose="False"):
 
         sup = super(NeuralNetworkRegressor, self)
-        sup.__init__(layers=[], loss_function=loss_function, learning_rate=learning_rate,
+        sup.__init__(layers=layers, loss_function=loss_function, learning_rate=learning_rate,
                      batch_size=batch_size, max_epcohs=max_epochs, update_algorithm=update_algorithm,
                      verbose=verbose)
 
