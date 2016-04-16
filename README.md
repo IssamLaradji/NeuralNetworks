@@ -9,3 +9,10 @@ can have different layers and update rules, initializing them is just a bit more
 
 `examples.py` shows how to initialize a classification and a regression model and train them on different datasets.
 
+
+References
+==========
+
+* https://github.com/Theano/Theano
+* https://github.com/HIPS/autograd
+* https://github.com/scikit-learn/scikit-learn
