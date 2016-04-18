@@ -38,21 +38,3 @@ for dataset, class_weight in product(classification_datasets.values(),
     assert_array_equal(pred1, pred2)
     print randomnn_standard.score(X, y)
     assert_greater(randomnn_standard.score(X, y), 0.95)
-
-    from scipy.linalg import sqrtm, inv
-    import numpy as np
-
-def nonlin_elu(X, hid_units):
-    w_matrix = 2*np.random.random((X.shape[1],hid_units))-1
-
-    #orthonormalize weight matrix
-    onorm_w_matrix = w_matrix.dot(inv(sqrtm(w_matrix.T.dot(w_matrix))))
-    blob = np.dot(X,onorm_w_matrix)
-
-    #after blob passes through activation finction
-    a=1
-    blob_activation = np.where(blob>0,blob,a*(np.exp(blob)-1))
-    return np.real(blob_activation)
-
-X, y = classification_datasets.values()[0]
-print nonlin_elu(X, 50)
