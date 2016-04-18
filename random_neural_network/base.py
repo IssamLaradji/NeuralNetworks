@@ -25,6 +25,24 @@ def logistic(X):
     return logistic_sigmoid(X, out=X)
 
 
+def elu(X):
+    """Compute the Exponential Linear Unit
+
+    Parameters
+    ----------
+    X : {array-like, sparse matrix}, shape (n_samples, n_features)
+        The input data.
+
+    Returns
+    -------
+    X_new : {array-like, sparse matrix}, shape (n_samples, n_features)
+        The transformed data.
+    """
+    indices = X > 0
+    X[indices] = np.exp(X[indices]) - 1
+
+    return X
+
 def tanh(X):
     """Compute the hyperbolic tan function inplace.
 
@@ -78,4 +96,4 @@ def softmax(X):
     return X
 
 
-ACTIVATIONS = {'tanh': tanh, 'logistic': logistic, 'relu': relu}
+ACTIVATIONS = {'tanh': tanh, 'logistic': logistic, 'relu': relu, 'elu': elu}
